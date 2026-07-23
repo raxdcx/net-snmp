@@ -1,0 +1,122 @@
+name: build el9 rpm
+
+# Build the rax-net-snmp RPM on push to packaging-el9 (for
+# smoke-testing changes) and on tag push (for producing a
+# release). Only the tag-push path publishes.
+
+on:
+  push:
+    branches: [packaging-el9]
+    paths:
+      - packaging/el9/**
+      - .github/workflows/build-rpm-el9.yml
+    # Tags of the form rax-<netsnmp-version>-<release> — e.g.
+    # rax-5.9.1-1 — trigger a release build and publish.
+    tags: ['rax-*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to create a GitHub Release on tag push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+
+    steps:
+      - name: Install build deps
+        run: |
+          # Base image ships curl-minimal; asking for `curl` here
+          # would conflict. actions/checkout uses its own curl.
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build rpmdevtools \
+            gcc make perl-core perl-Text-Tabs+Wrap \
+            zlib-devel elfutils-libelf-devel \
+            diffutils file which \
+            tar gzip patch git
+
+      - uses: actions/checkout@v5
+
+      - name: Fetch source tarballs
+        working-directory: packaging/el9
+        run: |
+          mkdir -p sources
+          curl -sSLo sources/net-snmp-5.9.1.tar.gz \
+            https://downloads.sourceforge.net/project/net-snmp/net-snmp/5.9.1/net-snmp-5.9.1.tar.gz
+          curl -sSLo sources/openssl-1.0.2u.tar.gz \
+            https://www.openssl.org/source/old/1.0.2/openssl-1.0.2u.tar.gz
+          # Verify SHA256s — pinned so drift in upstream mirrors
+          # can't slip a different tarball into the build.
+          sha256sum -c <<'EOF'
+          ecd0c6ffb493dd06707d38b14bb4d8c2288bb7033735606569d8f90f89669d16  sources/openssl-1.0.2u.tar.gz
+          eb7fd4a44de6cddbffd9a92a85ad1309e5c1054fb9d5a7dd93079c8953f48c3f  sources/net-snmp-5.9.1.tar.gz
+          EOF
+
+      - name: rpmbuild
+        working-directory: packaging/el9
+        run: |
+          TOPDIR="$PWD/.rpmbuild"
+          mkdir -p "$TOPDIR"/{BUILD,BUILDROOT,RPMS,SRPMS,SOURCES,SPECS}
+          cp sources/* "$TOPDIR/SOURCES/"
+          cp rax-net-snmp.spec "$TOPDIR/SPECS/"
+          rpmbuild --define "_topdir $TOPDIR" -bb "$TOPDIR/SPECS/rax-net-snmp.spec"
+          mkdir -p rpms
+          cp -v "$TOPDIR"/RPMS/*/*.rpm rpms/
+
+      - name: Inspect the built package
+        working-directory: packaging/el9
+        run: |
+          for rpm in rpms/*.rpm; do
+            echo "=== $rpm ==="
+            rpm -qip "$rpm"
+            echo
+            echo "--- files ---"
+            rpm -qlp "$rpm" | head -30
+            echo "..."
+            echo "total: $(rpm -qlp "$rpm" | wc -l)"
+          done
+
+      - name: Smoke-test the built package
+        working-directory: packaging/el9
+        run: |
+          dnf install -y rpms/*.rpm
+
+          # Confirm DES is back in the parser
+          /opt/rax-net-snmp/bin/snmpget --help 2>&1 \
+            | grep -qE 'x PROTOCOL.*DES' && echo OK_DES_IN_HELP
+
+          # Confirm the binary picks up our bundled openssl
+          ldd /opt/rax-net-snmp/bin/snmpget \
+            | grep -q '/opt/rax-net-snmp/openssl10/lib/libcrypto.so.1.0.0' \
+            && echo OK_LINKED_TO_BUNDLED_OPENSSL
+
+          # Exercise the DES-CBC path end-to-end by sending a real
+          # v3+authPriv packet to an unreachable target. If crypto
+          # is broken this exits with a specific error before
+          # networking; if crypto works, we hit a network timeout.
+          out=$(timeout 4 /opt/rax-net-snmp/bin/snmpget \
+              -v3 -l authPriv \
+              -u testuser -A testauthpass -a SHA \
+              -X testprivpass -x DES \
+              -t 1 -r 0 \
+              127.0.0.1:16161 1.3.6.1.2.1.1.1.0 2>&1) || true
+          echo "$out"
+          echo "$out" | grep -qi timeout && echo OK_DES_CRYPTO_WORKED
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax-net-snmp-el9-rpms
+          path: packaging/el9/rpms/*.rpm
+          retention-days: 30
+
+      - name: Publish to Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/rax-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Built from ${GITHUB_SHA:0:10}. See packaging/el9/README.md." \
+            packaging/el9/rpms/*.rpm
