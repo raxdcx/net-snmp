@@ -111,12 +111,24 @@ jobs:
           path: packaging/el9/rpms/*.rpm
           retention-days: 30
 
+      # softprops/action-gh-release is used rather than `gh
+      # release create` because the rockylinux:9 build container
+      # does not include the GitHub CLI, and this action ships
+      # its own JS-based implementation that works inside any
+      # container.
       - name: Publish to Release (tag push only)
         if: startsWith(github.ref, 'refs/tags/rax-')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Built from ${GITHUB_SHA:0:10}. See packaging/el9/README.md." \
-            packaging/el9/rpms/*.rpm
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            Built from ${{ github.sha }}.
+
+            See `packaging/el9/README.md` for install and layout
+            details. To consume this RPM from ansible, add:
+
+            ```
+            dnf install -y https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rax-net-snmp-5.9.1-1.el9.x86_64.rpm
+            ```
+          files: packaging/el9/rpms/*.rpm
+          fail_on_unmatched_files: true
