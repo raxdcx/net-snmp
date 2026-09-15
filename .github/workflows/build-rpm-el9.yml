@@ -126,6 +126,11 @@ jobs:
       - name: Extract tag annotation for release body
         if: startsWith(github.ref, 'refs/tags/rax-')
         run: |
+          # The checkout is owned by a different UID than the user git
+          # runs as inside the rockylinux:9 container, so git refuses to
+          # operate on it ("detected dubious ownership"). Whitelist the
+          # workspace before any git invocation.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # actions/checkout@v5 by default fetches with depth=1
           # and doesn't fetch tag objects, so annotations aren't
           # available. Re-fetch the tag with its object so we
