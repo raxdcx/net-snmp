@@ -17,9 +17,6 @@ mkdir -p sources rpms
 [ -f sources/net-snmp-5.9.1.tar.gz ] || \
     curl -sSLo sources/net-snmp-5.9.1.tar.gz \
         https://downloads.sourceforge.net/project/net-snmp/net-snmp/5.9.1/net-snmp-5.9.1.tar.gz
-[ -f sources/openssl-1.0.2u.tar.gz ] || \
-    curl -sSLo sources/openssl-1.0.2u.tar.gz \
-        https://www.openssl.org/source/old/1.0.2/openssl-1.0.2u.tar.gz
 
 docker run --rm --platform linux/amd64 \
     -v "$PWD":/work \
@@ -33,6 +30,7 @@ set -euo pipefail
 dnf install -y --setopt=install_weak_deps=False \
     rpm-build rpmdevtools \
     gcc make perl-core perl-Text-Tabs+Wrap \
+    openssl-devel \
     zlib-devel elfutils-libelf-devel \
     diffutils file which \
     tar gzip patch

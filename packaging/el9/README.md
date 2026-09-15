@@ -1,26 +1,39 @@
 # rax-net-snmp — Rocky/RHEL 9 packaging
 
-Parallel-install net-snmp CLI utilities with DES-CBC re-enabled,
-bundled with OpenSSL 1.0.2u. Installs under `/opt/rax-net-snmp/`
-so it coexists with the system `net-snmp` package.
+Parallel-install net-snmp CLI utilities with DES-CBC left enabled,
+built against the system OpenSSL 3.x. Installs under
+`/opt/rax-net-snmp/` so it coexists with the system `net-snmp`
+package.
 
 ## Why this exists
 
-Rocky 9 ships `net-snmp-5.9.1-<N>.el9` built with `--disable-des`
-against OpenSSL 3.x. On OpenSSL 3.5+, even loading the legacy
-provider is not enough to restore the low-level `DES_*` API that
-net-snmp's `snmplib/scapi.c` calls (the direct DES functions in
-`openssl/des.h` have been retired, not merely deprecated).
+Rocky 9 ships `net-snmp-5.9.1-<N>.el9` built with `--disable-des`,
+so the stock `snmpget` rejects `-x DES` during argument parsing:
 
-Rewriting the DES paths in `scapi.c` to use the modern EVP API
-would be the proper upstream fix, but is out of scope for
-"unblock a handful of legacy switches before they retire."
+```
+$ /usr/bin/snmpget -v3 -l authPriv -x DES ...
+Invalid privacy protocol specified after -3x flag: DES
+```
 
-Instead: build our own net-snmp with `--disable-des` removed, and
-bundle it with OpenSSL 1.0.2u — where DES-CBC is a first-class
-cipher and no provider machinery is involved. The result is an
-`snmpget/snmpset/snmpwalk` at `/opt/rax-net-snmp/bin/` that can
-still speak SNMPv3 with `-x DES`.
+That is the entire reason for a parallel build. net-snmp enables
+DES by default, so this package simply declines to disable it.
+
+No bundled OpenSSL is required. The low-level DES API that
+`snmplib/scapi.c` calls — `DES_key_sched`, `DES_ncbc_encrypt`,
+`DES_cbc_encrypt` — is **deprecated since OpenSSL 3.0 but still
+exported and functional** by `libcrypto.so.3`:
+
+```
+$ nm -D --defined-only /lib64/libcrypto.so.3 | grep DES_key_sched
+0000000000151d40 T DES_key_sched@@OPENSSL_3.0.0
+```
+
+The build emits `'DES_key_sched' is deprecated: Since OpenSSL 3.0`
+warnings and works.
+
+Earlier revisions of this package (5.9.1-1) bundled OpenSSL 1.0.2u
+on the belief that these functions had been removed in OpenSSL 3.5.
+That was incorrect, and the bundle has been dropped as of 5.9.1-2.
 
 ## Consumers
 
@@ -39,16 +52,13 @@ capability list says they need DES (currently the Cisco Catalyst
 │   └── (~16 utils)
 ├── lib/
 │   └── libnetsnmp.so.40  libnetsnmpagent.so.40  ...
-├── share/snmp/
-│   └── (runtime data files)
-└── openssl10/
-    ├── bin/openssl bin/c_rehash
-    ├── lib/libcrypto.so.1.0.0  lib/libssl.so.1.0.0  lib/engines/
-    └── ssl/openssl.cnf ssl/certs/ ssl/private/
+└── share/snmp/
+    └── (runtime data files)
 ```
 
-The binaries carry `RPATH=/opt/rax-net-snmp/openssl10/lib`, so no
-`LD_LIBRARY_PATH` wrapper is needed at runtime.
+The binaries link the system `libcrypto.so.3` / `libssl.so.3`, so
+there is no bundled crypto tree and no `RPATH` or
+`LD_LIBRARY_PATH` machinery.
 
 ## Building locally
 
@@ -62,49 +72,57 @@ cd packaging/el9
 
 Output RPM lands at `packaging/el9/rpms/rax-net-snmp-*.rpm`.
 
-First build takes ~4 minutes (dnf deps + openssl compile serial +
-net-snmp compile parallel). Subsequent builds reuse the cached
-tarballs at `packaging/el9/sources/`.
+Subsequent builds reuse the cached tarball at
+`packaging/el9/sources/`.
 
 ## Versioning
 
-Package version tracks the net-snmp release we bundle. The
-`Release:` field's `.raxN` suffix bumps for packaging changes
-that don't advance net-snmp itself:
+Package version tracks the net-snmp release we build. The
+`Release:` field bumps for packaging changes that don't advance
+net-snmp itself:
 
-- `rax-net-snmp-5.9.1-1.el9.x86_64.rpm` — first build.
-- `rax-net-snmp-5.9.1-2.el9.x86_64.rpm` — same net-snmp, spec
-  fix.
-- `rax-net-snmp-5.9.5-1.el9.x86_64.rpm` — net-snmp 5.9.5, if
-  we ever move.
+- `rax-net-snmp-5.9.1-1.el9.x86_64.rpm` — first build, bundled
+  OpenSSL 1.0.2u.
+- `rax-net-snmp-5.9.1-2.el9.x86_64.rpm` — same net-snmp, bundle
+  dropped, system OpenSSL 3.x.
+- `rax-net-snmp-5.10-1.el9.x86_64.rpm` — net-snmp 5.10, if we
+  move (see below).
 
-## Bundled OpenSSL
+## Verification
 
-OpenSSL 1.0.2u (final release of the 1.0.2 line, 2019-12-20) is
-End-of-Life upstream and receives no CVE fixes. The security
-tradeoff for this package is:
-
-- The bundled libcrypto/libssl are *only* used by our
-  `/opt/rax-net-snmp/bin/*` binaries. They are not exposed to
-  the system's dynamic linker default search path.
-- These binaries only ever *initiate* outbound SNMPv3 sessions
-  to devices we own. They do not accept inbound cryptographic
-  input from anywhere, so the risk surface is limited to the
-  device side of a session we started.
-
-If that changes (e.g. we ever host an snmptrap listener from
-this binary), reassess. Otherwise, the package should live
-until the last DES-only device retires.
+5.9.1-2 was validated against a live DES-only device —
+`f22-9-8it.iad3` in staging, a `C2950-I6K2L2Q4-M` running IOS
+`12.1(22)EA14` — using SNMPv3 `authPriv` with SHA auth and DES
+privacy. `sysDescr`, `sysUpTime` and `sysName` all returned
+identically to the 5.9.1-1 bundled build, and the stock system
+`snmpget` rejected the same request. The device refuses AES
+(`Unknown Report message`), confirming DES is the only privacy
+protocol it accepts.
 
 ## Related upstream work
 
-net-snmp does not currently offer a supported story for DES on
-OpenSSL 3.5+. Two upstream contributions would fix the root
-cause and let us retire this package early:
+Both contributions previously wanted here have now **landed on
+net-snmp master** (targeting 5.10):
 
-1. `OSSL_PROVIDER_load(NULL, "legacy")` at library init when
-   built against OpenSSL 3.x.
-2. Rewrite the DES paths in `snmplib/scapi.c` to use the EVP
-   API (mirrors the AES path already in the same file).
+1. `b28cc6d96` — `libsnmp: Load OpenSSL 3.0+ providers`, which
+   calls `OSSL_PROVIDER_load(NULL, "legacy")` in `sc_init()`.
+2. `768dd0922` — `libsnmp: Port DES support to OpenSSL EVP API`.
+   (`a2fd47857` removes the now-stale `sc_shutdown()` declaration
+   and is needed alongside them.)
 
-See net-snmp/net-snmp#294 and #518 for the ongoing discussion.
+Master built from those was also verified against the same
+Catalyst 2950 and works. It carries **zero** references to the
+deprecated low-level `DES_*` symbols, routing DES through EVP plus
+the legacy provider instead — confirmed by the fact that emptying
+`OPENSSL_MODULES` (so `legacy.so` cannot load) makes master fail
+with `USM encryption error` while 5.9.1 is unaffected.
+
+That makes moving to 5.10 the durable follow-up once it is
+released: it removes reliance on a deprecated API rather than
+merely tolerating it. Backporting the three commits to 5.9.1 is
+possible but only partly effective — 15 low-level `DES_*` call
+sites remain in the 5.9.1 tree, so patched 5.9.1 still rides the
+deprecated path.
+
+See net-snmp/net-snmp#294 and #518 for the discussion and test
+results.

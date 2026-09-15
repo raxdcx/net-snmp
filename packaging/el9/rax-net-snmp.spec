@@ -1,50 +1,58 @@
 # rax-net-snmp: a parallel-install net-snmp with DES-CBC privacy
-# support, bundled with its own OpenSSL 1.0.2u so DES-CBC stays
-# functional regardless of what the system OpenSSL 3.x provider
-# stack decides to expose.
+# support, built against the system OpenSSL 3.x.
 #
 # Installed under /opt/rax-net-snmp so there's no collision with
 # the stock net-snmp package. The caller (fire-engine's fe_snmp_cli)
 # routes DES-requiring device sessions to /opt/rax-net-snmp/bin/snmpget
 # and leaves everything else on the system snmpget.
 #
+# Why this package exists: Rocky 9 builds net-snmp with
+# --disable-des, so the stock snmpget rejects `-x DES` during
+# argument parsing. That is the whole reason for a parallel build.
+# net-snmp enables DES by default, so this spec simply declines to
+# disable it.
+#
+# It does NOT need a bundled OpenSSL. The low-level DES API
+# (DES_key_sched, DES_ncbc_encrypt, DES_cbc_encrypt) is deprecated
+# since OpenSSL 3.0 but is still exported and functional by
+# libcrypto.so.3 — verified against 3.5.5 on Rocky 9.8, including a
+# live SNMPv3/DES exchange with a Catalyst 2950. Earlier revisions of
+# this package bundled OpenSSL 1.0.2u on the belief that the API had
+# been removed; that was incorrect.
+#
+# Longer term, net-snmp master (5.10+) ports DES to the EVP API and
+# loads the OpenSSL legacy provider, which removes reliance on the
+# deprecated calls entirely. When 5.10 ships, bumping
+# %%{netsnmp_version} is the durable follow-up.
+#
 # Intended lifetime: stop-gap until the last handful of DES-only
 # switches (~8 Cisco Catalyst 2950s in the current fleet) retire.
 # When they do, drop this package from the ansible fleet.
 
-# The two upstream releases we bundle. Keep pinned; the whole point
-# is a reproducible build against known-good sources.
+# The upstream release we build. Keep pinned; the whole point
+# is a reproducible build against a known-good source.
 %global netsnmp_version 5.9.1
-%global openssl10_version 1.0.2u
 
-# Install prefix. Everything (net-snmp + bundled openssl 1.0.2u)
-# lives under here.
+# Install prefix.
 %global rax_prefix /opt/rax-net-snmp
-%global rax_openssl %{rax_prefix}/openssl10
 
 # rpmbuild's default policy tries to build a debug subpackage; net-snmp
 # with our slimmed feature set has almost no debug info worth shipping
 # and the debug package tries to reach into system paths we've bypassed.
 %global debug_package %{nil}
 
-# We don't want rpmbuild's automatic Requires: scan to add a hard
-# dependency on our own bundled libcrypto.so.10 (it lives inside our
-# own prefix; there's no external provider). Filter it out.
-%global __provides_exclude_from ^%{rax_openssl}/lib/.*\\.so.*$
-%global __requires_exclude ^libcrypto\\.so\\.1\\.0\\.0|^libssl\\.so\\.1\\.0\\.0
-
 Name:           rax-net-snmp
 Version:        %{netsnmp_version}
-Release:        1%{?dist}
-Summary:        net-snmp CLI tools with DES-CBC support (bundled OpenSSL 1.0.2u)
-License:        BSD and OpenSSL
+Release:        2%{?dist}
+Summary:        net-snmp CLI tools with DES-CBC support (system OpenSSL)
+License:        BSD
 URL:            https://github.com/raxdcx/net-snmp
 
 Source0:        https://downloads.sourceforge.net/project/net-snmp/net-snmp/%{netsnmp_version}/net-snmp-%{netsnmp_version}.tar.gz
-Source1:        https://www.openssl.org/source/old/1.0.2/openssl-%{openssl10_version}.tar.gz
 
 BuildRequires:  gcc make perl-core
 BuildRequires:  perl-Text-Tabs+Wrap
+BuildRequires:  openssl-devel
 BuildRequires:  zlib-devel elfutils-libelf-devel
 BuildRequires:  diffutils file which
 
@@ -54,9 +62,7 @@ Conflicts:      %{name} < %{version}
 %description
 Parallel-installed net-snmp CLI utilities (snmpget, snmpset, snmpwalk,
 snmpbulkget, snmpbulkwalk, snmptrap, snmptranslate, etc.) with the DES-CBC
-SNMPv3 privacy protocol re-enabled. Bundles OpenSSL 1.0.2u under the same
-prefix so DES-CBC stays functional regardless of the system OpenSSL 3.x
-version.
+SNMPv3 privacy protocol left enabled, built against the system OpenSSL 3.x.
 
 All files install under %{rax_prefix}. The system net-snmp package is
 untouched.
@@ -68,45 +74,14 @@ impact on the rest of the fleet.
 
 %prep
 %setup -q -n net-snmp-%{netsnmp_version}
-# Second tarball unpacks alongside the net-snmp source. We build
-# openssl first from openssl-%{openssl10_version}/ then net-snmp
-# from the parent.
-tar xf %{SOURCE1}
-
-
-# Stage dir for the bundled openssl 1.0.2u. rpmbuild wipes
-# %%{buildroot} between %%build and %%install, so anything we
-# install there in %%build would be lost. Stage under _builddir
-# (which persists) and copy to buildroot in %%install.
-%global openssl_stage %{_builddir}/openssl10-stage
 
 
 %build
-# --- Phase 1: build openssl 1.0.2u into the stage dir ---
-pushd openssl-%{openssl10_version}
-./Configure linux-%{_arch} shared no-ssl2 no-ssl3 \
-    --prefix=%{rax_openssl} \
-    --openssldir=%{rax_openssl}/ssl \
-    -Wl,-rpath,%{rax_openssl}/lib
-# openssl 1.0.2's Makefile is serial-only (its recursive make does
-# not cooperate with GNU make's jobserver). ~90s serial is fine.
-make
-# install_sw = libs + headers + binary; skips the massive doc set.
-# INSTALL_PREFIX is openssl 1.0.2's equivalent of DESTDIR.
-rm -rf %{openssl_stage}
-make INSTALL_PREFIX=%{openssl_stage} install_sw
-popd
-
-# --- Phase 2: build net-snmp against the staged openssl ---
-# Link-time -L points at the stage path; RPATH points at the real
-# target path so the binary finds openssl at runtime after install.
-export CPPFLAGS="-I%{openssl_stage}%{rax_openssl}/include"
-export LDFLAGS="-L%{openssl_stage}%{rax_openssl}/lib -Wl,-rpath,%{rax_openssl}/lib"
-
 ./configure \
     --prefix=%{rax_prefix} \
     --with-defaults \
-    --with-openssl=%{openssl_stage}%{rax_openssl} \
+    --with-openssl \
+    --enable-des \
     --enable-blumenthal-aes \
     --enable-ipv6 \
     --enable-ucd-snmp-compatibility \
@@ -115,6 +90,11 @@ export LDFLAGS="-L%{openssl_stage}%{rax_openssl}/lib -Wl,-rpath,%{rax_openssl}/l
     --disable-manuals \
     --disable-scripts
 
+# --enable-des is net-snmp's default, but state it explicitly: the
+# entire purpose of this package is that DES stays compiled in, and
+# an explicit flag means a future upstream default change can't
+# silently turn this package into a duplicate of stock net-snmp.
+#
 # --enable-blumenthal-aes turns on AES-192-CFB / AES-256-CFB
 # privacy protocols per draft-blumenthal-aes-usm-04. Without it,
 # `snmpget -x` only accepts DES and (128-bit) AES; Cisco IOS
@@ -141,19 +121,7 @@ make %{?_smp_mflags}
 
 
 %install
-# net-snmp's `make install` re-links a couple of libraries as an
-# installsubdirlibs step, which needs -lcrypto findable. Re-export
-# the same LDFLAGS we used in %%build so those links resolve
-# against the staged openssl.
-export CPPFLAGS="-I%{openssl_stage}%{rax_openssl}/include"
-export LDFLAGS="-L%{openssl_stage}%{rax_openssl}/lib -Wl,-rpath,%{rax_openssl}/lib"
-
 make install DESTDIR=%{buildroot}
-
-# Copy staged openssl into buildroot at the final location.
-# `-a` preserves symlinks (libcrypto.so → libcrypto.so.1.0.0).
-mkdir -p %{buildroot}%{rax_openssl}
-cp -a %{openssl_stage}%{rax_openssl}/. %{buildroot}%{rax_openssl}/
 
 # --- Trim what we don't want to ship ---
 # We're a runtime-only utils package. No headers, no static libs,
@@ -161,12 +129,8 @@ cp -a %{openssl_stage}%{rax_openssl}/. %{buildroot}%{rax_openssl}/
 rm -rf %{buildroot}%{rax_prefix}/include
 rm -rf %{buildroot}%{rax_prefix}/share/man
 rm -rf %{buildroot}%{rax_prefix}/lib/pkgconfig
-rm -rf %{buildroot}%{rax_openssl}/include
-rm -rf %{buildroot}%{rax_openssl}/share
-rm -rf %{buildroot}%{rax_openssl}/lib/pkgconfig
 find %{buildroot}%{rax_prefix} -name "*.la" -delete
 find %{buildroot}%{rax_prefix} -name "*.a"  -delete
-find %{buildroot}%{rax_openssl} -name "*.a" -delete
 # We ship the versioned libs (.so.40, .so.40.1.0) and the unversioned
 # symlinks (.so). The unversioned symlinks are useful for ad-hoc
 # debugging and cost nothing since they're symlinks; keep them.
@@ -182,23 +146,6 @@ rm -rf %{buildroot}%{rax_prefix}/share/snmp/snmp_perl_trapd.pl
 rm -f %{buildroot}%{rax_prefix}/bin/net-snmp-config
 rm -f %{buildroot}%{rax_prefix}/bin/net-snmp-create-v3-user
 
-# --- Trim what we don't need to ship ---
-# We're a runtime-utils package. No headers, no static libs, no
-# pkg-config files, no libtool archives, no man pages we opted out
-# of, no perl bindings.
-rm -rf %{buildroot}%{rax_prefix}/include
-rm -rf %{buildroot}%{rax_prefix}/share/man
-rm -rf %{buildroot}%{rax_openssl}/include
-rm -rf %{buildroot}%{rax_openssl}/share
-find %{buildroot}%{rax_prefix} -name "*.la" -delete
-find %{buildroot}%{rax_prefix} -name "*.a" -delete
-find %{buildroot}%{rax_openssl} -name "*.a" -delete
-rm -rf %{buildroot}%{rax_prefix}/lib/pkgconfig
-
-# net-snmp-config is a build-time helper for THIRD-party projects
-# to link against net-snmp; we're not a devel package, so drop it.
-rm -f %{buildroot}%{rax_prefix}/bin/net-snmp-config
-
 
 %files
 %dir %{rax_prefix}
@@ -211,19 +158,21 @@ rm -f %{buildroot}%{rax_prefix}/bin/net-snmp-config
 # writes even with --disable-mibs. Ship the tree; it's small.
 %{rax_prefix}/share
 
-%dir %{rax_openssl}
-%dir %{rax_openssl}/bin
-%dir %{rax_openssl}/lib
-%dir %{rax_openssl}/ssl
-%{rax_openssl}/bin/openssl
-%{rax_openssl}/bin/c_rehash
-%{rax_openssl}/lib/lib*.so.*
-%{rax_openssl}/lib/lib*.so
-%{rax_openssl}/lib/engines
-%{rax_openssl}/ssl
-
 
 %changelog
+* Tue Sep 15 2026 Sam Warters <sam.warters@rackspace.com> - 5.9.1-2
+- Drop the bundled OpenSSL 1.0.2u and build against the system
+  OpenSSL 3.x instead. The low-level DES API is deprecated since
+  OpenSSL 3.0 but remains exported and functional in libcrypto.so.3,
+  so the bundle was never required. Verified on Rocky 9.8 with
+  OpenSSL 3.5.5 against a live Catalyst 2950 (C2950-I6K2L2Q4-M,
+  IOS 12.1(22)EA14): SNMPv3 authPriv with DES returns sysDescr,
+  sysUpTime and sysName identically to the 5.9.1-1 bundled build.
+  Removes an end-of-life, unpatched OpenSSL from the package.
+- Pass --enable-des explicitly rather than relying on the upstream
+  default.
+- De-duplicate the repeated trim block in %%install.
+
 * Wed Jul 22 2026 Sam Warters <sam.warters@rackspace.com> - 5.9.1-1
 - Initial parallel-install build; bundles OpenSSL 1.0.2u; DES-CBC
   re-enabled in net-snmp %{netsnmp_version}. Coexists with the stock
