@@ -32,6 +32,7 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             rpm-build rpmdevtools \
             gcc make perl-core perl-Text-Tabs+Wrap \
+            openssl-devel \
             zlib-devel elfutils-libelf-devel \
             diffutils file which \
             tar gzip patch git
@@ -44,12 +45,9 @@ jobs:
           mkdir -p sources
           curl -sSLo sources/net-snmp-5.9.1.tar.gz \
             https://downloads.sourceforge.net/project/net-snmp/net-snmp/5.9.1/net-snmp-5.9.1.tar.gz
-          curl -sSLo sources/openssl-1.0.2u.tar.gz \
-            https://www.openssl.org/source/old/1.0.2/openssl-1.0.2u.tar.gz
           # Verify SHA256s — pinned so drift in upstream mirrors
           # can't slip a different tarball into the build.
           sha256sum -c <<'EOF'
-          ecd0c6ffb493dd06707d38b14bb4d8c2288bb7033735606569d8f90f89669d16  sources/openssl-1.0.2u.tar.gz
           eb7fd4a44de6cddbffd9a92a85ad1309e5c1054fb9d5a7dd93079c8953f48c3f  sources/net-snmp-5.9.1.tar.gz
           EOF
 
@@ -86,10 +84,20 @@ jobs:
           /opt/rax-net-snmp/bin/snmpget --help 2>&1 \
             | grep -qE 'x PROTOCOL.*DES' && echo OK_DES_IN_HELP
 
-          # Confirm the binary picks up our bundled openssl
+          # Confirm the binary links the SYSTEM OpenSSL 3 and that no
+          # bundled crypto tree survives. Both directions are asserted:
+          # a missing libcrypto.so.3 or a resurrected openssl10/ path
+          # means the packaging regressed.
           ldd /opt/rax-net-snmp/bin/snmpget \
-            | grep -q '/opt/rax-net-snmp/openssl10/lib/libcrypto.so.1.0.0' \
-            && echo OK_LINKED_TO_BUNDLED_OPENSSL
+            | grep -q '/lib64/libcrypto.so.3' \
+            && echo OK_LINKED_TO_SYSTEM_OPENSSL3
+          if ldd /opt/rax-net-snmp/bin/snmpget | grep -q 'openssl10'; then
+            echo "FAIL: bundled openssl10 path reappeared"; exit 1
+          fi
+          if rpm -qlp rpms/*.rpm | grep -q 'openssl10'; then
+            echo "FAIL: package payload contains openssl10 files"; exit 1
+          fi
+          echo OK_NO_BUNDLED_OPENSSL
 
           # Exercise the DES-CBC path end-to-end by sending a real
           # v3+authPriv packet to an unreachable target. If crypto
@@ -127,6 +135,10 @@ jobs:
           if [ -z "$annotation" ]; then
             annotation="Built from ${GITHUB_SHA:0:10}. See packaging/el9/README.md."
           fi
+          # Derive the RPM filename from what was actually built rather
+          # than hardcoding a version — a hardcoded name silently goes
+          # stale on every Release: bump.
+          rpm_name=$(basename "$(ls packaging/el9/rpms/*.rpm | head -1)")
           {
             echo "$annotation"
             echo
@@ -135,7 +147,7 @@ jobs:
             echo "**Install:**"
             echo
             echo '```'
-            echo "dnf install -y https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/rax-net-snmp-5.9.1-1.el9.x86_64.rpm"
+            echo "dnf install -y https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${rpm_name}"
             echo '```'
             echo
             echo "Built from commit \`${GITHUB_SHA:0:10}\` by workflow run [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}).  "
